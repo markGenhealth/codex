@@ -4,6 +4,7 @@ use crate::common::ResponseStream;
 use crate::common::ResponsesWsRequest;
 use crate::common::SafetyBufferingTreatment;
 use crate::common::WS_REQUEST_HEADER_TRACEPARENT_CLIENT_METADATA_KEY;
+use crate::common::apply_prompt_cache_breakpoints;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::rate_limits::parse_rate_limit_event;
@@ -901,13 +902,33 @@ async fn send_websocket_request(
 }
 
 fn serialize_websocket_request(request: &ResponsesWsRequest<'_>) -> Result<String, ApiError> {
-    serde_json::to_string(request)
-        .map_err(|err| ApiError::Stream(format!("failed to encode websocket request: {err}")))
+    let ResponsesWsRequest::ResponseCreate(response_create) = request;
+    if response_create.prompt_cache_breakpoints.is_empty() {
+        serde_json::to_string(request)
+    } else {
+        let mut wire_request = serde_json::to_value(request).map_err(|err| {
+            ApiError::Stream(format!("failed to encode websocket request: {err}"))
+        })?;
+        if !apply_prompt_cache_breakpoints(
+            &mut wire_request,
+            &response_create.prompt_cache_breakpoints,
+        ) {
+            return Err(ApiError::Stream(
+                "failed to locate explicit prompt cache breakpoint".to_string(),
+            ));
+        }
+        serde_json::to_string(&wire_request)
+    }
+    .map_err(|err| ApiError::Stream(format!("failed to encode websocket request: {err}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::PromptCacheBreakpoint;
+    use crate::common::PromptCacheMode;
+    use crate::common::PromptCacheOptions;
+    use crate::common::PromptCacheTtl;
     use crate::common::ResponseCreateWsRequest;
     use crate::common::ResponsesApiRequest;
     use codex_protocol::ResponseItemId;
@@ -954,6 +975,14 @@ mod tests {
             include: vec!["reasoning.encrypted_content".to_string()],
             service_tier: Some("priority".to_string()),
             prompt_cache_key: Some("cache-key".to_string()),
+            prompt_cache_options: Some(PromptCacheOptions {
+                mode: PromptCacheMode::Explicit,
+                ttl: PromptCacheTtl::ThirtyMinutes,
+            }),
+            prompt_cache_breakpoints: vec![PromptCacheBreakpoint {
+                input_index: 0,
+                content_index: 0,
+            }],
             text: None,
             client_metadata: Some(HashMap::from([(
                 "traceparent".to_string(),
@@ -971,6 +1000,8 @@ mod tests {
         expected_payload["type"] = json!("response.create");
         expected_payload["previous_response_id"] = json!("resp-1");
         expected_payload["generate"] = json!(false);
+        expected_payload["input"][0]["content"][0]["prompt_cache_breakpoint"] =
+            json!({"mode": "explicit"});
         let request_text =
             serialize_websocket_request(&request).expect("serialize websocket request");
         let wire_payload =

@@ -116,6 +116,12 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
 use crate::feedback_tags;
+use crate::prompt_cache::CACHE_COHORT_METADATA_KEY;
+use crate::prompt_cache::CACHE_KEY_VERSION;
+use crate::prompt_cache::CACHE_KEY_VERSION_METADATA_KEY;
+use crate::prompt_cache::STABLE_PREFIX_CACHE_PERCENT_ENV;
+use crate::prompt_cache::StablePrefixCachePlan;
+use crate::prompt_cache::stable_prefix_cache_plan;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::util::emit_feedback_auth_recovery_tags;
@@ -255,6 +261,7 @@ pub struct ModelClient {
     state: Arc<ModelClientState>,
     agent_identity_policy: AgentIdentityAuthPolicy,
     prompt_cache_key_override: Option<String>,
+    stable_prefix_cache_percent: u8,
     http_client_factory: HttpClientFactory,
 }
 
@@ -323,6 +330,8 @@ fn responses_request_properties_match(
         include: previous_include,
         service_tier: previous_service_tier,
         prompt_cache_key: previous_prompt_cache_key,
+        prompt_cache_options: previous_prompt_cache_options,
+        prompt_cache_breakpoints: previous_prompt_cache_breakpoints,
         text: previous_text,
         client_metadata: _,
     } = previous;
@@ -340,6 +349,8 @@ fn responses_request_properties_match(
         include: current_include,
         service_tier: current_service_tier,
         prompt_cache_key: current_prompt_cache_key,
+        prompt_cache_options: current_prompt_cache_options,
+        prompt_cache_breakpoints: current_prompt_cache_breakpoints,
         text: current_text,
         client_metadata: _,
     } = current;
@@ -357,6 +368,8 @@ fn responses_request_properties_match(
         && previous_include == current_include
         && previous_service_tier == current_service_tier
         && previous_prompt_cache_key == current_prompt_cache_key
+        && previous_prompt_cache_options == current_prompt_cache_options
+        && previous_prompt_cache_breakpoints == current_prompt_cache_breakpoints
         && previous_text == current_text
 }
 
@@ -449,6 +462,19 @@ impl ModelClient {
         let auth_env_telemetry =
             collect_auth_env_telemetry(model_provider.info(), codex_api_key_env_enabled);
         let include_attestation = model_provider.supports_attestation();
+        let stable_prefix_cache_percent = std::env::var(STABLE_PREFIX_CACHE_PERCENT_ENV)
+            .ok()
+            .and_then(|value| match value.parse::<u8>() {
+                Ok(percent) if percent <= 100 => Some(percent),
+                _ => {
+                    warn!(
+                        env = STABLE_PREFIX_CACHE_PERCENT_ENV,
+                        value, "ignoring invalid stable prefix cache rollout percentage"
+                    );
+                    None
+                }
+            })
+            .unwrap_or(0);
         Self {
             state: Arc::new(ModelClientState {
                 thread_id,
@@ -469,6 +495,7 @@ impl ModelClient {
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
+            stable_prefix_cache_percent,
             http_client_factory,
         }
     }
@@ -593,6 +620,8 @@ impl ModelClient {
             reasoning,
             service_tier,
             prompt_cache_key,
+            prompt_cache_options: _,
+            prompt_cache_breakpoints: _,
             text,
             ..
         } = request;
@@ -918,7 +947,71 @@ impl ModelClient {
             &prompt.output_schema,
             prompt.output_schema_strict,
         );
-        let prompt_cache_key = Some(self.prompt_cache_key(responses_metadata));
+        let tools_for_cache_key = tools
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| {
+                CodexErr::Fatal(format!("failed to encode tool definitions: {error}"))
+            })?
+            .unwrap_or(serde_json::Value::Null);
+        let provider = self.state.provider.info();
+        let repository_scope = responses_metadata
+            .workspaces
+            .values()
+            .filter_map(|workspace| workspace.associated_remote_urls.as_ref())
+            .flat_map(|remotes| remotes.iter())
+            .map(|(name, url)| format!("{name}={url}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cache_plan = stable_prefix_cache_plan(
+            self.stable_prefix_cache_percent,
+            &provider.name,
+            provider.base_url.as_deref(),
+            &model_info.slug,
+            &instructions,
+            &tools_for_cache_key,
+            &input,
+            &repository_scope,
+            &responses_metadata.installation_id,
+            &responses_metadata.session_id,
+        );
+        let mut client_metadata = responses_metadata.client_metadata();
+        let (prompt_cache_key, prompt_cache_options, prompt_cache_breakpoints) = match cache_plan {
+            StablePrefixCachePlan::Disabled => (
+                Some(self.prompt_cache_key(responses_metadata)),
+                None,
+                Vec::new(),
+            ),
+            StablePrefixCachePlan::Control => {
+                client_metadata
+                    .insert(CACHE_COHORT_METADATA_KEY.to_string(), "control".to_string());
+                (
+                    Some(self.prompt_cache_key(responses_metadata)),
+                    None,
+                    Vec::new(),
+                )
+            }
+            StablePrefixCachePlan::Treatment {
+                prompt_cache_key,
+                prompt_cache_options,
+                prompt_cache_breakpoints,
+            } => {
+                client_metadata.insert(
+                    CACHE_COHORT_METADATA_KEY.to_string(),
+                    "treatment".to_string(),
+                );
+                client_metadata.insert(
+                    CACHE_KEY_VERSION_METADATA_KEY.to_string(),
+                    CACHE_KEY_VERSION.to_string(),
+                );
+                (
+                    Some(prompt_cache_key),
+                    Some(prompt_cache_options),
+                    prompt_cache_breakpoints,
+                )
+            }
+        };
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
             model: model_info.slug.clone(),
@@ -934,8 +1027,10 @@ impl ModelClient {
             include,
             service_tier,
             prompt_cache_key,
+            prompt_cache_options,
+            prompt_cache_breakpoints,
             text,
-            client_metadata: Some(responses_metadata.client_metadata()),
+            client_metadata: Some(client_metadata),
         };
         Ok(request)
     }

@@ -269,6 +269,10 @@ pub struct ResponsesApiRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<PromptCacheOptions>,
+    #[serde(skip)]
+    pub prompt_cache_breakpoints: Vec<PromptCacheBreakpoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<TextControls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_metadata: Option<HashMap<String, String>>,
@@ -291,6 +295,8 @@ impl<'a> From<&'a ResponsesApiRequest> for ResponseCreateWsRequest<'a> {
             include: &request.include,
             service_tier: request.service_tier.as_deref(),
             prompt_cache_key: request.prompt_cache_key.as_deref(),
+            prompt_cache_options: request.prompt_cache_options.as_ref(),
+            prompt_cache_breakpoints: request.prompt_cache_breakpoints.clone(),
             text: request.text.as_ref(),
             generate: None,
             client_metadata: request.client_metadata.clone(),
@@ -321,11 +327,63 @@ pub struct ResponseCreateWsRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_key: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_options: Option<&'a PromptCacheOptions>,
+    #[serde(skip)]
+    pub prompt_cache_breakpoints: Vec<PromptCacheBreakpoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<&'a TextControls>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generate: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_metadata: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptCacheBreakpoint {
+    pub input_index: usize,
+    pub content_index: usize,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PromptCacheOptions {
+    pub mode: PromptCacheMode,
+    pub ttl: PromptCacheTtl,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptCacheMode {
+    Explicit,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub enum PromptCacheTtl {
+    #[serde(rename = "30m")]
+    ThirtyMinutes,
+}
+
+pub fn apply_prompt_cache_breakpoints(
+    value: &mut Value,
+    breakpoints: &[PromptCacheBreakpoint],
+) -> bool {
+    breakpoints.iter().copied().all(|breakpoint| {
+        let Some(content) = value
+            .get_mut("input")
+            .and_then(Value::as_array_mut)
+            .and_then(|input| input.get_mut(breakpoint.input_index))
+            .and_then(|item| item.get_mut("content"))
+            .and_then(Value::as_array_mut)
+            .and_then(|content| content.get_mut(breakpoint.content_index))
+            .and_then(Value::as_object_mut)
+        else {
+            return false;
+        };
+        content.insert(
+            "prompt_cache_breakpoint".to_string(),
+            serde_json::json!({ "mode": "explicit" }),
+        );
+        true
+    })
 }
 
 pub fn response_create_client_metadata(

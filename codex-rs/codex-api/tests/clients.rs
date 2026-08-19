@@ -9,6 +9,10 @@ use codex_api::ApiError;
 use codex_api::AuthError;
 use codex_api::AuthProvider;
 use codex_api::Compression;
+use codex_api::PromptCacheBreakpoint;
+use codex_api::PromptCacheMode;
+use codex_api::PromptCacheOptions;
+use codex_api::PromptCacheTtl;
 use codex_api::Provider;
 use codex_api::ResponsesApiRequest;
 use codex_api::ResponsesClient;
@@ -331,6 +335,8 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_options: None,
+        prompt_cache_breakpoints: Vec::new(),
         text: None,
         client_metadata: None,
     };
@@ -352,6 +358,92 @@ async fn responses_client_stream_request_preserves_item_ids() -> Result<()> {
     assert_eq!(
         prepared.headers.get(http::header::CONTENT_TYPE),
         Some(&HeaderValue::from_static("application/json"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn responses_client_adds_explicit_prompt_cache_metadata_without_rewriting_content()
+-> Result<()> {
+    let state = RecordingState::default();
+    let transport = RecordingTransport::new(state.clone());
+    let client = ResponsesClient::new(transport, provider("bedrock-mantle"), Arc::new(NoAuth));
+    let request = ResponsesApiRequest {
+        model: "openai.gpt-5.6-terra".into(),
+        instructions: "Stable system instructions".into(),
+        input: vec![
+            ResponseItem::Message {
+                id: None,
+                role: "developer".into(),
+                content: vec![ContentItem::InputText {
+                    text: "Stable developer instructions".into(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "user".into(),
+                content: vec![ContentItem::InputText {
+                    text: "# AGENTS.md instructions\nStable repository instructions".into(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ],
+        tools: Some(empty_tools().into()),
+        tool_choice: "auto".into(),
+        parallel_tool_calls: false,
+        reasoning: None,
+        store: false,
+        stream: true,
+        stream_options: None,
+        include: Vec::new(),
+        service_tier: None,
+        prompt_cache_key: Some("codex-gpt56-stable".into()),
+        prompt_cache_options: Some(PromptCacheOptions {
+            mode: PromptCacheMode::Explicit,
+            ttl: PromptCacheTtl::ThirtyMinutes,
+        }),
+        prompt_cache_breakpoints: vec![
+            PromptCacheBreakpoint {
+                input_index: 0,
+                content_index: 0,
+            },
+            PromptCacheBreakpoint {
+                input_index: 1,
+                content_index: 0,
+            },
+        ],
+        text: None,
+        client_metadata: None,
+    };
+
+    let _stream = client
+        .stream_request(request, ResponsesOptions::default())
+        .await?;
+
+    let requests = state.take_stream_requests();
+    let prepared = requests[0]
+        .prepare_body_for_send()
+        .expect("body should prepare");
+    let body: serde_json::Value =
+        serde_json::from_slice(prepared.body.as_deref().expect("body should be JSON"))?;
+    assert_eq!(
+        body["prompt_cache_options"],
+        serde_json::json!({"mode": "explicit", "ttl": "30m"})
+    );
+    assert_eq!(
+        body["input"][1]["content"][0],
+        serde_json::json!({
+            "type": "input_text",
+            "text": "# AGENTS.md instructions\nStable repository instructions",
+            "prompt_cache_breakpoint": {"mode": "explicit"}
+        })
+    );
+    assert_eq!(
+        body["input"][0]["content"][0]["prompt_cache_breakpoint"],
+        serde_json::json!({"mode": "explicit"})
     );
     Ok(())
 }
@@ -418,6 +510,8 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_options: None,
+        prompt_cache_breakpoints: Vec::new(),
         text: None,
         client_metadata: None,
     };
@@ -538,6 +632,8 @@ async fn azure_store_sends_ids_and_headers() -> Result<()> {
         include: Vec::new(),
         service_tier: None,
         prompt_cache_key: None,
+        prompt_cache_options: None,
+        prompt_cache_breakpoints: Vec::new(),
         text: None,
         client_metadata: None,
     };

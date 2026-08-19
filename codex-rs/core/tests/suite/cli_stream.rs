@@ -254,6 +254,132 @@ async fn responses_mode_stream_cli() {
     assert_eq!(request.path(), "/v1/responses");
 }
 
+/// Verifies GEN-6598 at the CLI boundary used by ACP and direct review lanes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn gpt56_stable_prefix_cache_changes_only_cache_metadata() {
+    skip_if_no_network!();
+
+    let server = MockServer::start().await;
+    let sse = responses::sse(vec![
+        responses::ev_response_created("resp-1"),
+        responses::ev_assistant_message("msg-1", "hi"),
+        responses::ev_completed("resp-1"),
+    ]);
+    let resp_mock = responses::mount_sse_sequence(&server, vec![sse.clone(), sse]).await;
+    let provider_override = format!(
+        "model_providers.mantle={{ name = \"Amazon Bedrock Mantle\", base_url = \"{}/v1\", env_key = \"PATH\", wire_api = \"responses\" }}",
+        server.uri()
+    );
+    let home = TempDir::new().unwrap();
+
+    for rollout_percent in ["0", "100"] {
+        let bin = codex_utils_cargo_bin::cargo_bin("codex").unwrap();
+        let mut cmd = Command::new(bin);
+        cmd.arg("exec")
+            .arg("--skip-git-repo-check")
+            .arg("-c")
+            .arg(&provider_override)
+            .arg("-c")
+            .arg("model_provider=\"mantle\"")
+            .arg("-m")
+            .arg("openai.gpt-5.6-terra")
+            .arg("-C")
+            .arg(repo_root())
+            .arg("verify stable prefix caching");
+        cmd.env("CODEX_HOME", home.path())
+            .env("CODEX_GPT56_STABLE_PREFIX_CACHE_PERCENT", rollout_percent);
+
+        let output = run_cli_command(&mut cmd).unwrap();
+        assert!(
+            output.status.success(),
+            "CLI failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let requests = resp_mock.requests();
+    assert_eq!(requests.len(), 2);
+    let control = requests[0].body_json();
+    let treatment = requests[1].body_json();
+    assert!(control.get("prompt_cache_options").is_none());
+    assert_eq!(
+        treatment["prompt_cache_options"],
+        serde_json::json!({"mode": "explicit", "ttl": "30m"})
+    );
+    assert!(
+        treatment["prompt_cache_key"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("codex-gpt56-"))
+    );
+
+    let mut control_input = control["input"].clone();
+    let mut treatment_input = treatment["input"].clone();
+    let treatment_items = treatment_input.as_array_mut().expect("treatment input");
+    let breakpoint_content = treatment_items
+        .iter_mut()
+        .flat_map(|item| {
+            item["content"]
+                .as_array_mut()
+                .into_iter()
+                .flat_map(|content| content.iter_mut())
+        })
+        .find(|content| {
+            content["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("# AGENTS.md instructions"))
+        })
+        .expect("repository instructions content");
+    assert_eq!(
+        breakpoint_content["prompt_cache_breakpoint"],
+        serde_json::json!({"mode": "explicit"})
+    );
+    let breakpoint_count = treatment_items
+        .iter()
+        .flat_map(|item| {
+            item["content"]
+                .as_array()
+                .into_iter()
+                .flat_map(|content| content.iter())
+        })
+        .filter(|content| content.get("prompt_cache_breakpoint").is_some())
+        .count();
+    assert!(
+        breakpoint_count >= 2,
+        "expected stable and repository breakpoints"
+    );
+    for content in treatment_items.iter_mut().flat_map(|item| {
+        item["content"]
+            .as_array_mut()
+            .into_iter()
+            .flat_map(|content| content.iter_mut())
+    }) {
+        content
+            .as_object_mut()
+            .expect("content object")
+            .remove("prompt_cache_breakpoint");
+    }
+
+    for input in [&mut control_input, &mut treatment_input] {
+        for item in input.as_array_mut().expect("request input") {
+            item.as_object_mut().expect("input object").remove("id");
+        }
+    }
+
+    assert_eq!(treatment_input, control_input);
+    for field in [
+        "model",
+        "instructions",
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "reasoning",
+        "service_tier",
+        "text",
+    ] {
+        assert_eq!(treatment[field], control[field], "field changed: {field}");
+    }
+}
+
 /// Ensures `openai_base_url` config override routes built-in openai provider requests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
