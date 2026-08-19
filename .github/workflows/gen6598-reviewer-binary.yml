@@ -24,6 +24,7 @@ jobs:
             arch: aarch64
     defaults:
       run:
+        shell: bash
         working-directory: codex-rs
     steps:
       - name: Install Linux build dependencies
