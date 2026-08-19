@@ -12,6 +12,7 @@ jobs:
   build:
     name: Build ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -25,6 +26,12 @@ jobs:
       run:
         working-directory: codex-rs
     steps:
+      - name: Install Linux build dependencies
+        working-directory: /
+        run: |
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils build-essential ca-certificates curl git libcap-dev libssl-dev pkg-config
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
