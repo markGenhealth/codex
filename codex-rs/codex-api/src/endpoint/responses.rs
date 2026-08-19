@@ -1,6 +1,7 @@
 use crate::auth::SharedAuthProvider;
 use crate::common::ResponseStream;
 use crate::common::ResponsesApiRequest;
+use crate::common::apply_prompt_cache_breakpoints;
 use crate::endpoint::session::EndpointSession;
 use crate::error::ApiError;
 use crate::provider::Provider;
@@ -81,8 +82,21 @@ impl<T: HttpTransport> ResponsesClient<T> {
             turn_state,
         } = options;
 
-        let body = EncodedJsonBody::encode(&request)
-            .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
+        let body = if request.prompt_cache_breakpoints.is_empty() {
+            EncodedJsonBody::encode(&request)
+        } else {
+            let mut wire_request = serde_json::to_value(&request).map_err(|e| {
+                ApiError::Stream(format!("failed to encode responses request: {e}"))
+            })?;
+            if !apply_prompt_cache_breakpoints(&mut wire_request, &request.prompt_cache_breakpoints)
+            {
+                return Err(ApiError::Stream(
+                    "failed to locate explicit prompt cache breakpoint".to_string(),
+                ));
+            }
+            EncodedJsonBody::encode(&wire_request)
+        }
+        .map_err(|e| ApiError::Stream(format!("failed to encode responses request: {e}")))?;
 
         let mut headers = extra_headers;
         if let Some(ref thread_id) = thread_id {

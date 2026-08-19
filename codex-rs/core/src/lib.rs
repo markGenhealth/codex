@@ -76,6 +76,7 @@ pub use mention_syntax::TOOL_MENTION_SIGIL;
 pub use utils::path_utils;
 pub(crate) mod plugins;
 pub use plugins::plugins_manager_for_config;
+mod prompt_cache;
 #[doc(hidden)]
 pub(crate) mod prompt_debug;
 #[doc(hidden)]
